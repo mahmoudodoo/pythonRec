@@ -1,66 +1,122 @@
 import os
-import datetime
+import uuid
+import glob
+import sys
 
-drive = "/dev/sda2"  # Replace X with the appropriate drive identifier (e.g., a, b, c, etc.)
-size = 512  # Size of bytes to read
+# Configuration
+FILES_PER_FOLDER = 4
+BLOCK_SIZE = 512  # Bytes to read per block
 
-start_date = datetime.datetime(2023, 9, 1)  # Specify the start date
-end_date = datetime.datetime(2023, 9, 2)  # Specify the end date
+def get_available_drives():
+    """Get list of available drives in /dev"""
+    return glob.glob('/dev/sd*') + glob.glob('/dev/hd*') + glob.glob('/dev/nvme*')
 
-def create_directory(directory_name):
-    if not os.path.exists(directory_name):
-        os.makedirs(directory_name)
-
-def get_next_rec_directory():
-    rec_directory_prefix = "rec"
-    index = 1
+def select_drive():
+    """Display available drives and let user choose"""
+    drives = get_available_drives()
+    
+    if not drives:
+        print("No drives found!")
+        sys.exit(1)
+    
+    print("\nAvailable drives:")
+    for i, drive in enumerate(drives, 1):
+        print(f"{i}. {drive}")
+    
     while True:
-        rec_directory = f"{rec_directory_prefix}{index}"
-        if not os.path.exists(rec_directory):
-            return rec_directory
-        index += 1
+        try:
+            choice = int(input("\nSelect drive (enter number): "))
+            if 1 <= choice <= len(drives):
+                return drives[choice-1]
+            print("Invalid selection. Try again.")
+        except ValueError:
+            print("Please enter a valid number.")
 
-script_directory = os.path.dirname(os.path.abspath(__file__))
-current_rec_directory = "rec"
-create_directory(current_rec_directory)
+def create_directory(path):
+    """Create directory if it doesn't exist"""
+    os.makedirs(path, exist_ok=True)
 
-with open(drive, "rb") as fileD:
-    byte = fileD.read(size)
-    offs = 0  # Offset location
-    rcvd = 0  # Recovered file ID
-    files_in_current_rec = 0
+def main():
+    # Create main recovery directory
+    base_dir = "recovered_jpegs"
+    create_directory(base_dir)
+    
+    # Let user select drive
+    drive_path = select_drive()
+    print(f"\nSelected drive: {drive_path}")
+    print("Starting recovery... Press Ctrl+C to stop\n")
+    
+    current_group = None
+    files_in_group = 0
+    file_counter = 1
+    last_byte = None  # For handling split markers
 
-    while byte:
-        found = byte.find(b'\xFF\xD8\xFF')
-        if found >= 0:
-            print(f'==== Found JPEG at location: {hex(found + (size * offs))} ====')
-            drec = True
-            rcvd += 1
-
-            # Extract the JPEG segment
-            jpeg_segment = byte[found:]
+    try:
+        with open(drive_path, "rb") as disk:
+            block = disk.read(BLOCK_SIZE)
+            offset = 0
             
-            file_creation_time = os.path.getctime(drive)
-            file_creation_date = datetime.datetime.fromtimestamp(file_creation_time)
+            while block:
+                # Find JPEG header signature (FF D8 FF)
+                header_pos = block.find(b'\xFF\xD8\xFF')
+                
+                if header_pos >= 0:
+                    print(f"Found JPEG signature at offset: {hex(header_pos + (BLOCK_SIZE * offset))}")
+                    
+                    # Create new group directory if needed
+                    if files_in_group % FILES_PER_FOLDER == 0:
+                        group_id = uuid.uuid4().hex
+                        current_group = os.path.join(base_dir, group_id)
+                        create_directory(current_group)
+                        print(f"\nCreated new group: {group_id}")
+                    
+                    # Setup recovery variables
+                    recovering = True
+                    output_path = os.path.join(current_group, f"{file_counter}.jpg")
+                    
+                    with open(output_path, "wb") as jpg_file:
+                        # Write header and remaining data from current block
+                        jpg_file.write(block[header_pos:])
+                        last_byte = block[-1]  # Track last byte for split markers
+                        
+                        # Continue reading until end marker (FF D9)
+                        while recovering:
+                            block = disk.read(BLOCK_SIZE)
+                            offset += 1
+                            
+                            if not block:
+                                break
+                            
+                            # Check for split end marker (across block boundary)
+                            if last_byte == 0xFF and block[0] == 0xD9:
+                                jpg_file.write(b'\xD9')
+                                recovering = False
+                            
+                            # Check for end marker within current block
+                            end_pos = block.find(b'\xFF\xD9')
+                            if end_pos >= 0:
+                                jpg_file.write(block[:end_pos + 2])
+                                recovering = False
+                            else:
+                                jpg_file.write(block)
+                                last_byte = block[-1]  # Update last byte
+                    
+                    print(f"Recovered file: {output_path}")
+                    files_in_group += 1
+                    file_counter += 1
+                
+                # Read next block
+                block = disk.read(BLOCK_SIZE)
+                offset += 1
+                
+    except PermissionError:
+        print("\nError: Permission denied. Try running with sudo.")
+    except KeyboardInterrupt:
+        print("\nRecovery stopped by user")
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+    
+    print(f"\nRecovery complete! Total files recovered: {file_counter-1}")
 
-            if start_date <= file_creation_date <= end_date:
-                if files_in_current_rec >= 30:
-                    current_rec_directory = get_next_rec_directory()
-                    create_directory(current_rec_directory)
-                    files_in_current_rec = 0
-
-                files_in_current_rec += 1
-                rec_directory_path = os.path.join(script_directory, current_rec_directory, f'{rcvd}.jpg')
-                with open(rec_directory_path, 'wb') as fileN:
-                    fileN.write(jpeg_segment)
-                    while drec:
-                        byte = fileD.read(size)
-                        if byte.startswith(b'\xFF\xD9'):  # Check for the end of the JPEG segment
-                            fileN.write(byte)
-                            print(f'==== Wrote JPEG to location: {rec_directory_path} ====\n')
-                            drec = False
-                        else:
-                            fileN.write(byte)
-
-        byte = fileD.read(size)
-        offs += 1
+if __name__ == "__main__":
+    main()
