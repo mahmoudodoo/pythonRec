@@ -14,12 +14,16 @@ def get_available_drives():
         import string
         from ctypes import windll
         drives = []
+        # Get logical drives (C:, D:, etc.)
         bitmask = windll.kernel32.GetLogicalDrives()
         for letter in string.ascii_uppercase:
             if bitmask & 1:
                 drives.append(f"{letter}:\\")
             bitmask >>= 1
-        return drives
+
+        # Add physical drives
+        physical_drives = glob.glob(r'\\.\PhysicalDrive*')
+        return drives + physical_drives
     else:  # Linux/Mac
         return glob.glob('/dev/sd*') + glob.glob('/dev/hd*') + glob.glob('/dev/nvme*') + glob.glob('/dev/disk*')
 
@@ -39,7 +43,11 @@ def select_drive():
         try:
             choice = int(input("\nSelect drive (enter number): "))
             if 1 <= choice <= len(drives):
-                return drives[choice-1]
+                selected = drives[choice-1]
+                # Convert Windows logical drive to physical path
+                if platform.system() == 'Windows' and selected.endswith(':\\'):
+                    return f"\\\\.\\{selected[0]}:"
+                return selected
             print("Invalid selection. Try again.")
         except ValueError:
             print("Please enter a valid number.")
@@ -82,12 +90,12 @@ def get_file_signatures(recovery_type):
         },
         'mp4': {
             'header': b'\x00\x00\x00\x18ftypmp42',
-            'footer': None,  # MP4 files don't have a standard footer
+            'footer': None,
             'extension': 'mp4'
         },
         'mkv': {
             'header': b'\x1a\x45\xdf\xa3',
-            'footer': None,  # MKV files don't have a standard footer
+            'footer': None,
             'extension': 'mkv'
         }
     }
@@ -109,35 +117,29 @@ def recover_files(disk, signature, base_dir, current_group, files_in_group, file
     recovered_files = 0
 
     while block:
-        # Find file header signature
         header_pos = block.find(signature['header'])
 
         if header_pos >= 0:
             print(f"Found {signature['extension'].upper()} signature at offset: {hex(header_pos + (BLOCK_SIZE * offset))}")
 
-            # Create new group directory if needed
             if files_in_group[0] % FILES_PER_FOLDER == 0:
                 group_id = uuid.uuid4().hex
                 current_group[0] = os.path.join(base_dir, group_id)
                 create_directory(current_group[0])
                 print(f"\nCreated new group: {group_id}")
 
-            # Setup recovery variables
-            recovering = True
             output_path = os.path.join(current_group[0], f"{file_counter[0]}.{signature['extension']}")
 
             with open(output_path, "wb") as output_file:
-                # Write initial block
                 output_file.write(block[header_pos:])
+                recovering = True
 
-                # Continue reading until footer is found (if applicable)
                 while recovering:
                     block = disk.read(BLOCK_SIZE)
                     if not block:
                         break
 
                     if signature['footer']:
-                        # Check for file end marker
                         end_pos = block.find(signature['footer'])
                         if end_pos >= 0:
                             output_file.write(block[:end_pos + signature['footer_length']])
@@ -145,13 +147,11 @@ def recover_files(disk, signature, base_dir, current_group, files_in_group, file
                         else:
                             output_file.write(block)
                     else:
-                        # For files without footer, use heuristic approach
-                        # Look for next header or read fixed amount of data
+                        # For files without footer, look for next header or max size
                         next_header_pos = block.find(signature['header'])
                         if next_header_pos >= 0:
                             output_file.write(block[:next_header_pos])
                             recovering = False
-                            # Rewind to the found position for next file
                             disk.seek(disk.tell() - (BLOCK_SIZE - next_header_pos))
                         else:
                             output_file.write(block)
@@ -161,36 +161,33 @@ def recover_files(disk, signature, base_dir, current_group, files_in_group, file
             file_counter[0] += 1
             recovered_files += 1
 
-        # Read next block
         block = disk.read(BLOCK_SIZE)
         offset += 1
 
     return recovered_files
 
 def main():
-    # Create main recovery directory
     base_dir = "recovered_files"
     create_directory(base_dir)
 
-    # Let user select drive
     drive_path = select_drive()
     print(f"\nSelected drive: {drive_path}")
 
-    # Let user select recovery type
     recovery_type = select_recovery_type()
     signatures = get_file_signatures(recovery_type)
 
     print("\nStarting recovery... Press Ctrl+C to stop\n")
 
-    # Use lists to allow modification in nested functions
     current_group = [None]
     files_in_group = [0]
     file_counter = [1]
     total_recovered = 0
 
     try:
-        if platform.system() == 'Windows' and not drive_path.endswith('\\'):
-            drive_path += '\\'
+        # Windows requires raw device access with this syntax
+        if platform.system() == 'Windows':
+            if not drive_path.startswith(r'\\.\'):
+                drive_path = fr'\\.\{drive_path.replace(":/", ":")}'
 
         with open(drive_path, "rb") as disk:
             for signature in signatures:
@@ -200,7 +197,11 @@ def main():
                 print(f"Recovered {recovered} {signature['extension'].upper()} files")
 
     except PermissionError:
-        print("\nError: Permission denied. Try running with administrator/root privileges.")
+        print("\nError: Permission denied. Try running as administrator.")
+    except FileNotFoundError:
+        print("\nError: Drive not found. Make sure you're using the correct path.")
+        if platform.system() == 'Windows':
+            print("On Windows, use format like: \\\\.\\PhysicalDrive0 or \\\\.\\C:")
     except KeyboardInterrupt:
         print("\nRecovery stopped by user")
     except Exception as e:
